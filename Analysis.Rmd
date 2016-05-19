@@ -1,0 +1,193 @@
+---
+title: "Analysis of Montreal breakins data 2015-16"
+author: "Quan Nguyen"
+date: "May 18, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Get data
+
+Data source:
+
+http://donnees.ville.montreal.qc.ca/dataset/actes-criminels
+
+```{r}
+library(data.table)
+library(dplyr)
+library(dygraphs)
+library(ggplot2)
+DT = fread(input = "donneesouvertes-citoyens.csv", header = T, sep=",", stringsAsFactors = T)
+DT
+DT %>% summary()
+str(DT)
+```
+
+# Plot over time
+
+```{r}
+library(zoo)
+# Add a few date attributes for timeseries processing
+DT$mydate = as.Date(as.character(DT$DATE), tz="EST", format="%Y%m%d")
+DT$year = as.Date(cut(DT$mydate, breaks="year"))
+DT$month = as.Date(cut(DT$mydate, breaks="month"))
+DT$week = as.Date(cut(DT$mydate, breaks="week"))
+DT$weekday = as.POSIXlt(DT$mydate)$wday
+
+# plot of daily breakins split by period (day, evening, night)
+ggplot(DT, aes(x=mydate, color=QUART)) + geom_freqpoly()
+ggplot(DT, aes(x=mydate)) + facet_grid(QUART ~ .) + geom_freqpoly()
+# plot number of breakins per week
+plot(table(DT$week), main="By Week", ylab="Breakins", type='l')
+# Plot nunber of breakins per month split by period
+ggplot(DT, aes(x=month, fill=QUART)) + geom_bar()
+# By weekday (0: Sunday)
+table(DT$weekday);
+ggplot(DT, aes(x=weekday, fill=QUART)) + geom_bar()
+# By Quart
+table(DT$QUART); 
+ggplot(DT, aes(x=QUART, fill=QUART)) + geom_bar()
+```
+
+# Create daily aggregate
+
+``` {r}
+DT_daily = count(DT, mydate)
+```
+
+# Convert to ts() series
+
+```{r}
+# frequency=365 will give proper x-axis tic values
+# however will not be accepted by stl() because of
+# series is not periodic or has less than two periods
+DT_daily.ts = ts(
+  DT_daily$n,
+  frequency=30 #, start=c(2015,0.1)
+)
+plot(DT_daily.ts)
+# timeseries decomposition
+DT_daily.stl = stl(DT_daily.ts, s.window=7)
+plot(DT_daily.stl)
+
+```
+
+
+
+``` {r}
+# Convert to zoo series
+
+DT_daily.z = zoo(
+  DT_daily$n,
+  order.by=DT_daily$mydate,
+  frequency=7
+)
+```
+
+``` {r eval=F, echo=F}
+sub_text = range(index(DT_daily.z))
+#plot(DT_daily.z, type="s")
+dygraph(DT_daily.z)
+
+DT_daily.z.decompose = decompose(ts(DT_daily.z,frequency=30), "additive")
+plot(DT_daily.z.decompose, xaxt='n')
+title(sub=paste(sub_text,collapse="  to  "))
+```
+
+# Arima forecast
+
+```{r}
+library(forecast)
+library(ggplot2)
+DT_daily.z.forecast =
+  forecast.Arima(
+    auto.arima(
+      DT_daily.ts
+    ), 
+    h=60
+  )
+autoplot(DT_daily.z.forecast)
+
+# prediction of the trendline
+
+DT_daily.ts.forecast =
+  forecast.Arima(
+    auto.arima(
+      DT_daily.stl$time.series[,2]
+    ), 
+    h=60
+  )
+autoplot(DT_daily.ts.forecast)
+```
+
+# Anomaly detection
+
+```{r}
+library(AnomalyDetection)
+myts = as.data.frame(
+  cbind(
+    as.POSIXct(index(DT_daily.z)),
+    coredata(DT_daily.z)
+  )
+)
+data_anomaly = AnomalyDetectionTs(myts, max_anoms=0.01, direction="pos", plot=F, e_value = T, na.rm = T)
+# No anomaly detected as NULL result returned
+data_anomaly
+data_anomaly$plot
+```
+
+  
+# EDA
+
+```{r}
+# Breakins by PDQ (Police de quartier) sorted
+DT %>% select(PDQ) %>% table %>% sort(decreasing=T) 
+DT %>% group_by(PDQ) %>% summarise(n = n()) %>% mutate(freq = n / sum(n)) %>% arrange(desc(freq)) %>% select(PDQ, freq)
+
+DT %>% select(PDQ, QUART) %>% table
+# columns without/with zero values
+colSums(DT == 0)
+colSums(DT != 0)
+DT_goodXY = DT %>% filter(X != 0); DT_goodXY
+library(ggplot2)
+# ggplot(DT_goodXY, aes(y=LAT, x=LONG, col=DT_goodXY$QUART)) + geom_point()
+```
+
+# Put it on the map
+
+```{r fig.width=12, fig.height=12}
+library(maptools)
+# needs all the files shipped in addition to .shp files
+mtl_admin_shp = readShapeSpatial("data/LIMADMIN.shp")
+mtl_admin_poly = readShapePoly("data/LIMADMIN") 
+
+mtl_admin_points = fortify(mtl_admin_shp)
+centroids.df <- as.data.frame(coordinates(mtl_admin_poly))
+names(centroids.df) <- c("long", "lat")
+centroids.df$id = as.character(mtl_admin_poly$NOM)
+
+# in ggplot over ggmap
+library(ggmap)
+montreal12 <- get_map(location = "montreal", zoom=12)
+gc3 = geocode("Pont Viau, Quebec", source="google")
+
+center <- as.numeric(gc3)
+montreal12 <- get_googlemap(location = "montreal", zoom=11, center=center)
+
+ggmap(montreal12) +
+  coord_equal() +
+  geom_point(data=DT_goodXY, aes(y=LAT, x=LONG, col=DT_goodXY$QUART)
+  )
+```
+
+# Conclusion
+
+* Breakins occur motly in daytime or evening, much less during the night
+* Breaskins are highest in Oct-Dec
+* Breaksins are highest on Monday
+* The data is just for 15 months so it's not enough to get a feel for yearly trend
+* Police de quartier stations 38, 26, 23 see the most number of breakins (10%, 6.7% and 6.3% respectively)
+* Note that the map only shows areas that are part of the city of Montreal only. There doesn't seem any part that has higher infractions
